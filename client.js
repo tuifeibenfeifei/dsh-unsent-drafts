@@ -81,6 +81,20 @@ window.__ModuleLoader__.load({
     /** 实时同步的轮询间隔（storage 事件只在同页面其他标签页触发，这里靠自己轮询） */
     const SYNC_INTERVAL_MS = 1200
 
+    /**
+     * 插件自己的草稿备份键。
+     *
+     * 为什么要备份：DSH 在会话切换时会把草稿搬到新会话并把源会话清空
+     * （`from.setDraft("")`），跨工作区切换尤其明显。等用户切走再回来看，
+     * localStorage 里那条记录已经是空串，任何「事后扫描」都捞不到。
+     * 所以插件必须自己持续记录「曾经出现过的非空草稿」。
+     */
+    const BACKUP_KEY = 'dsh.unsent-drafts.backup.v1'
+    /** 备份最多保留多少条（防 localStorage 无限增长） */
+    const BACKUP_LIMIT = 200
+    /** 同一会话的草稿最多保留几个历史版本 */
+    const BACKUP_PER_SESSION = 5
+
     /** 宿主 ctx：切会话用。模块作用域，组件闭包外也能读 */
     let hostCtx = null
 
@@ -247,6 +261,154 @@ window.__ModuleLoader__.load({
     }
 
     // ------------------------------------------------------------------
+    // 草稿备份（对抗 DSH 切换会话时清空草稿）
+    // ------------------------------------------------------------------
+
+    /**
+     * 读取备份。返回 { entries: [{ sessionId, text, refCount, savedAt }] }。
+     * 结构损坏时返回空表并重建，绝不抛。
+     */
+    function readBackup() {
+      try {
+        const ls = (typeof window !== 'undefined' && window.localStorage) || null
+        if (!ls) return []
+        const raw = ls.getItem(BACKUP_KEY)
+        if (!raw) return []
+        const parsed = JSON.parse(raw)
+        if (!parsed || !Array.isArray(parsed.entries)) return []
+        return parsed.entries.filter((e) => e && typeof e.sessionId === 'string' && typeof e.text === 'string')
+      } catch {
+        return []
+      }
+    }
+
+    /**
+     * 把一次扫描结果并进备份。
+     *
+     * 规则：
+     *   - 只记非空文本
+     *   - 同一会话同一文本不重复记（按 sessionId+text 去重）
+     *   - 同一会话最多留 BACKUP_PER_SESSION 条，保留最新的
+     *   - 总量超过 BACKUP_LIMIT 时丢最旧的
+     * 写入失败（配额满等）静默忽略，不影响面板。
+     */
+    function mergeIntoBackup(items) {
+      if (!items || items.length === 0) return
+      try {
+        const ls = (typeof window !== 'undefined' && window.localStorage) || null
+        if (!ls) return
+
+        const bySession = new Map()
+        let maxSeq = 0
+        for (const e of readBackup()) {
+          if (!bySession.has(e.sessionId)) bySession.set(e.sessionId, [])
+          bySession.get(e.sessionId).push(e)
+          if (typeof e.seq === 'number' && e.seq > maxSeq) maxSeq = e.seq
+        }
+
+        const now = Date.now()
+        // ⚠️ 不能只靠 savedAt 排序：同一毫秒内多次写入会并列，裁剪时
+        // 可能把最新的丢掉、留下最旧的（测试实测复现过）。用单调 seq 定序。
+        for (const it of items) {
+          const text = it && typeof it.text === 'string' ? it.text : ''
+          if (!text.trim()) continue
+          const sessionId = it.sessionId
+          const list = bySession.get(sessionId) || []
+          const same = list.find((e) => e.text === text)
+          if (same) {
+            same.savedAt = now
+            same.seq = ++maxSeq
+            if (it.refCount > same.refCount) same.refCount = it.refCount
+            continue
+          }
+          maxSeq += 1
+          list.push({
+            sessionId,
+            text,
+            refCount: it.refCount || 0,
+            savedAt: now,
+            seq: maxSeq,
+          })
+          bySession.set(sessionId, list)
+        }
+
+        // 每个会话裁剪到最新 N 条（按 seq 倒序取前 N）
+        let entries = []
+        for (const list of bySession.values()) {
+          list.sort((a, b) => (b.seq || 0) - (a.seq || 0))
+          entries.push(...list.slice(0, BACKUP_PER_SESSION))
+        }
+        // 全局裁剪
+        entries.sort((a, b) => (b.seq || 0) - (a.seq || 0))
+        entries = entries.slice(0, BACKUP_LIMIT)
+
+        ls.setItem(BACKUP_KEY, JSON.stringify({ version: 1, entries }))
+      } catch { /* 配额满等情况：备份是增强功能，失败不影响主流程 */ }
+    }
+
+    /** 清空备份 */
+    function clearBackup() {
+      try {
+        const ls = (typeof window !== 'undefined' && window.localStorage) || null
+        if (ls) ls.removeItem(BACKUP_KEY)
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * 汇总要展示的草稿：实时 ∪ 历史备份。
+     *
+     * 同一会话只出一行，实时优先（`source: 'live'`）；实时已经为空、
+     * 但插件曾记录过内容的，出一行 `source: 'backup'`，即「DSH 已清空，
+     * 但从备份救回」。这正是切换会话丢草稿后的恢复路径。
+     */
+    function collectItems() {
+      const scan = scanDrafts()
+      // 先把这次看到的实录进备份，再回头读——顺序不能反
+      try { mergeIntoBackup(scan.items) } catch { /* 备份失败不影响展示 */ }
+
+      const bySession = new Map()
+
+      // 备份先铺一遍（同会话取最新一条）
+      for (const e of readBackup()) {
+        const cur = bySession.get(e.sessionId)
+        if (!cur || (e.savedAt || 0) > (cur.savedAt || 0)) {
+          bySession.set(e.sessionId, {
+            key: 'backup:' + e.sessionId,
+            sessionId: e.sessionId,
+            text: e.text,
+            refCount: e.refCount || 0,
+            savedAt: e.savedAt || 0,
+            source: 'backup',
+          })
+        }
+      }
+
+      // 实时覆盖同名会话
+      for (const it of scan.items) {
+        bySession.set(it.sessionId, {
+          key: it.key,
+          sessionId: it.sessionId,
+          text: it.text,
+          refCount: it.refCount,
+          savedAt: Date.now(),
+          source: 'live',
+        })
+      }
+
+      const items = [...bySession.values()]
+      // 实时在前，其次按时间倒序
+      items.sort((a, b) => {
+        if (a.source !== b.source) return a.source === 'live' ? -1 : 1
+        return (b.savedAt || 0) - (a.savedAt || 0)
+      })
+
+      return { items, scan, backupTotal: readBackup().length }
+    }
+
+    // ------------------------------------------------------------------
     // 会话目录
     // ------------------------------------------------------------------
 
@@ -269,43 +431,54 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 用 sessions.search 拉会话目录（Host 侧搜索，空 query = 全量）。
+     * 读会话目录（标题/blank/等）。
+     *
+     * ⚠️ 用 sessions.list 快照，不用 sessions.search：
+     *   - `search(query, signal)` 文档要求 query **非空**（"non-blank literal phrase"），
+     *     传空串属于未定义用法，之前只是碰巧能返回数据。
+     *   - SessionSearchResultItem 只有 { sessionId, snippet }，**没有标题**，
+     *     拿它当目录用本来就是错的。
+     *
+     * sessions.list 是 ObservableSnapshot<SessionListState>。已核对
+     * `service.js` 的 projectList()，byId 里实际只有这些字段：
+     *   id / displayTitle / running / retainedBy / blank / updatedAt /
+     *   formatStatus / projectionValues / title? / cwd? / parentId? / origin?
+     * 所以这里**不要读 workspaceId / workspaceTitle / archived**——它们不存在，
+     * 读了只能得到 undefined。工作区信息用 cwd 的 basename 代替。
+     *
      * 失败返回 null，由调用方退化成「只显示 sessionId」。
      */
-    async function loadSessionCatalog() {
+    function loadSessionCatalog() {
       const s = svc('sessions')
-      if (!s || typeof s.search !== 'function') return null
+      if (!s || !s.list || typeof s.list.getSnapshot !== 'function') return null
       try {
-        const ac = typeof AbortController !== 'undefined' ? new AbortController() : null
-        const signal = ac ? ac.signal : undefined
-        // 3 秒后主动放弃，避免面板无限转圈
-        if (ac) setTimeout(() => { try { ac.abort() } catch { /* 忽略 */ } }, 3000)
-        const res = await s.search('', signal)
-        // RemoteResult：可能是 { items } 或 { data: { items } } 或裸数组
-        let items = null
-        if (Array.isArray(res)) items = res
-        else if (res && Array.isArray(res.items)) items = res.items
-        else if (res && res.data && Array.isArray(res.data.items)) items = res.data.items
-        if (!items) return null
-
+        const snap = s.list.getSnapshot()
+        if (!snap || !snap.byId) return null
         const map = {}
-        for (const it of items) {
+        for (const [id, it] of Object.entries(snap.byId)) {
           if (!it) continue
-          const id = it.sessionId || it.id
-          if (!id) continue
           map[String(id)] = {
-            title: it.title || it.name || '',
-            workspaceId: it.workspaceId || (it.workspace && it.workspace.id) || '',
-            workspaceTitle: (it.workspace && it.workspace.title)
-              || it.workspaceTitle || it.workspaceName || '',
+            title: it.displayTitle || it.title || '',
             blank: it.blank === true,
-            archived: it.archived === true,
+            running: it.running === true,
+            cwd: it.cwd || '',
+            updatedAt: it.updatedAt || 0,
+            origin: it.origin || '',
+            // 目录名当"工作区"展示（byId 无 workspaceTitle 字段）
+            workspaceTitle: cwdBase(it.cwd),
           }
         }
         return map
-      } catch (e) {
+      } catch {
         return null
       }
+    }
+
+    /** 从 cwd 取最后一段目录名，作为工作区显示名 */
+    function cwdBase(cwd) {
+      if (!cwd || typeof cwd !== 'string') return ''
+      const parts = cwd.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean)
+      return parts.length ? parts[parts.length - 1] : ''
     }
 
     // ------------------------------------------------------------------
@@ -313,25 +486,27 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     /**
-     * 尝试链：uiWorkspace.openSession(string) → openSession({sessionId})
-     *        → sessions.retain(string) → sessions.retain({sessionId})
-     * 返回 { ok, via } 或 { ok:false, reason }。绝不抛。
+     * 切回会话。绝不抛。
      *
-     * 为什么要尝试链：SessionTarget 的确切形状没有公开文档，
-     * 这里逐个试，把成功的那个记进诊断区。
+     * 按 API 实测收敛为两条真实可用的路径：
+     *   1. `uiWorkspace.openSession(target)` — target 是 `SessionId | SubagentAddress`，
+     *      也就是**字符串**，不是对象。它才是"选中会话并显示"的正规入口。
+     *   2. `sessions.retain(target, { source })` — 注意 `SessionRetainOptions.source`
+     *      是**必填**字段（旧代码传 `{}` 必然失败），且 retain 只负责持有引用，
+     *      并不会切换 UI 选中，所以它只是兜底手段。
+     *
+     * 返回 { ok, via } 或 { ok:false, reason }。
      */
     async function switchToSession(sessionId) {
       const attempts = []
       const ws = svc('uiWorkspace')
 
       if (ws && typeof ws.openSession === 'function') {
-        for (const target of [sessionId, { sessionId }]) {
-          try {
-            ws.openSession(target)
-            return { ok: true, via: 'uiWorkspace.openSession(' + (typeof target === 'string' ? 'string' : 'object') + ')' }
-          } catch (e) {
-            attempts.push('openSession(' + (typeof target === 'string' ? 'string' : 'object') + '): ' + errMsg(e))
-          }
+        try {
+          ws.openSession(sessionId)
+          return { ok: true, via: 'uiWorkspace.openSession' }
+        } catch (e) {
+          attempts.push('openSession: ' + errMsg(e))
         }
       } else {
         attempts.push('uiWorkspace.openSession 不存在')
@@ -339,15 +514,13 @@ window.__ModuleLoader__.load({
 
       const s = svc('sessions')
       if (s && typeof s.retain === 'function') {
-        for (const target of [sessionId, { sessionId }]) {
-          try {
-            const ref = s.retain(target, {})
-            // 有些实现把「打开」做在 reference 上
-            if (ref && typeof ref.open === 'function') ref.open()
-            return { ok: true, via: 'sessions.retain(' + (typeof target === 'string' ? 'string' : 'object') + ')' }
-          } catch (e) {
-            attempts.push('retain(' + (typeof target === 'string' ? 'string' : 'object') + '): ' + errMsg(e))
-          }
+        try {
+          // source 必填；controllerOperation 是宿主文档给出的合法来源值
+          const ref = s.retain(sessionId, { source: 'controllerOperation' })
+          try { if (ref && typeof ref.release === 'function') ref.release() } catch { /* 忽略 */ }
+          return { ok: true, via: 'sessions.retain（仅持有引用，可能未切换 UI）' }
+        } catch (e) {
+          attempts.push('retain: ' + errMsg(e))
         }
       } else {
         attempts.push('sessions.retain 不存在')
@@ -368,6 +541,18 @@ window.__ModuleLoader__.load({
     function shortId(id) {
       const s = String(id || '')
       return s.length > 8 ? s.slice(0, 8) : s
+    }
+
+    /** 时间戳 → 「MM-DD HH:mm」；解析不了就返回空串 */
+    function fmtTime(ms) {
+      try {
+        const d = new Date(Number(ms))
+        if (isNaN(d.getTime())) return ''
+        const p = (n) => String(n).padStart(2, '0')
+        return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+      } catch {
+        return ''
+      }
     }
 
     function copyText(text) {
@@ -567,27 +752,33 @@ window.__ModuleLoader__.load({
       const [items, setItems] = useState([])
       const [catalog, setCatalog] = useState(null)
       const [scanInfo, setScanInfo] = useState({ total: 0, prefixes: {}, sample: [], error: null })
+      const [backupTotal, setBackupTotal] = useState(0)
       const [busy, setBusy] = useState(false)
       const [note, setNote] = useState(null)
       const [showDiag, setShowDiag] = useState(false)
+      const [onlyLive, setOnlyLive] = useState(false)
 
       // 会话目录只拉一次：切会话不依赖它，它只用于显示标题
       useEffect(() => {
         let alive = true
-        loadSessionCatalog().then((map) => { if (alive) setCatalog(map) })
+        Promise.resolve().then(() => loadSessionCatalog()).then((map) => {
+          if (alive) setCatalog(map)
+        })
         return () => { alive = false }
       }, [])
 
       const refresh = useCallback(() => {
-        const r = scanDrafts()
+        const r = collectItems()
+        const scan = r.scan
         setItems(r.items)
+        setBackupTotal(r.backupTotal || 0)
         setScanInfo({
-          total: r.total,
-          prefixes: r.prefixes || {},
-          sample: r.sample || [],
-          parseFailed: r.parseFailed || 0,
-          noDraft: r.noDraft || 0,
-          error: r.error,
+          total: scan.total,
+          prefixes: scan.prefixes || {},
+          sample: scan.sample || [],
+          parseFailed: scan.parseFailed || 0,
+          noDraft: scan.noDraft || 0,
+          error: scan.error,
         })
       }, [])
 
@@ -628,6 +819,18 @@ window.__ModuleLoader__.load({
           : { kind: 'bad', text: '复制失败（浏览器拒绝了剪贴板访问）。' })
       }, [])
 
+      const onClearBackup = useCallback(() => {
+        const ok = clearBackup()
+        setNote(ok
+          ? { kind: 'good', text: '已清空草稿备份。之后只显示 localStorage 里仍然存在的草稿。' }
+          : { kind: 'bad', text: '清空备份失败。' })
+        refresh()
+      }, [refresh])
+
+      // 「仅看仍存在的草稿」：过滤掉只存在于备份里的历史条目
+      const visible = onlyLive ? items.filter((it) => it.source === 'live') : items
+      const backupOnlyCount = items.filter((it) => it.source === 'backup').length
+
       const prefixSummary = Object.keys(scanInfo.prefixes || {})
         .map((p) => p + ' × ' + scanInfo.prefixes[p])
         .join('　') || '（无）'
@@ -639,6 +842,7 @@ window.__ModuleLoader__.load({
         '识别到的草稿前缀：' + prefixSummary,
         'JSON 解析失败：' + (scanInfo.parseFailed || 0) + ' 条；无草稿字段：' + (scanInfo.noDraft || 0) + ' 条',
         '扫描上限：' + SCAN_LIMIT + ' 条',
+        '草稿备份：' + backupTotal + ' 条（只存在于备份、localStorage 已清空的：' + backupOnlyCount + ' 条）',
         '会话目录：' + (catalog === null ? '未取到（将只显示 sessionId）' : '已取到 ' + Object.keys(catalog).length + ' 个会话'),
         '切会话 API：uiWorkspace.openSession=' + (svc('uiWorkspace') && typeof svc('uiWorkspace').openSession === 'function' ? '有' : '无')
           + '，sessions.retain=' + (svc('sessions') && typeof svc('sessions').retain === 'function' ? '有' : '无'),
@@ -649,17 +853,35 @@ window.__ModuleLoader__.load({
         h('div', { key: 'inner', className: 'dshud-inner' }, [
           h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px' } }, [
             h('h2', { key: 't' }, '未发送草稿'),
-            h('button', {
-              key: 'r',
-              className: 'dshud-btn',
-              type: 'button',
-              onClick: refresh,
-            }, '刷新'),
+            h('div', { key: 'tools', className: 'dshud-acts' }, [
+              backupOnlyCount > 0
+                ? h('button', {
+                  key: 'filter',
+                  className: 'dshud-btn',
+                  type: 'button',
+                  onClick: () => setOnlyLive((v) => !v),
+                  title: '切换是否隐藏「仅存在于备份」的历史草稿',
+                }, onlyLive ? '显示全部' : '仅看现存')
+                : null,
+              h('button', {
+                key: 'r',
+                className: 'dshud-btn',
+                type: 'button',
+                onClick: refresh,
+              }, '刷新'),
+            ]),
           ]),
 
           h('div', { key: 'lead', className: 'dshud-hint' },
             '这里列出所有「打了字但还没发送」的会话。点击某一条即可切回该会话，'
             + '草稿会由 DSH 自动回填到输入框。'),
+
+          backupOnlyCount > 0
+            ? h('div', { key: 'bkinfo', className: 'dshud-tip' },
+              '其中 ' + backupOnlyCount + ' 条来自本插件的草稿备份——它们在 DSH 里已被清空'
+              + '（切换会话时 DSH 会搬走并清空源草稿），点击只能尝试跳回会话，'
+              + '文字请用「复制」取走。')
+            : null,
 
           scanInfo.error
             ? h('div', { key: 'err', className: 'dshud-tip bad' }, '⚠ ' + scanInfo.error)
@@ -672,23 +894,27 @@ window.__ModuleLoader__.load({
             }, note.text)
             : null,
 
-          items.length === 0
+          visible.length === 0
             ? h('div', { key: 'empty', className: 'dshud-empty' }, [
               h('div', { key: 'e1', style: { fontWeight: 700 } }, '没有未发送草稿'),
               h('div', { key: 'e2', style: { marginTop: '4px', fontSize: '12px' } },
-                '新建会话打几个字、不要发送，再切到别的会话，这里就会出现一条。'),
+                onlyLive
+                  ? '当前没有仍存在于 localStorage 的草稿。点「显示全部」可看备份里的历史记录。'
+                  : '新建会话打几个字、不要发送，再切到别的会话，这里就会出现一条。'),
             ])
-            : h('div', { key: 'list', className: 'dshud-list' }, items.map((item) => {
+            : h('div', { key: 'list', className: 'dshud-list' }, visible.map((item) => {
               const info = catalog ? catalog[String(item.sessionId)] : undefined
               const orphan = !info
+              const fromBackup = item.source === 'backup'
               const title = info && info.title ? info.title : ('会话 ' + shortId(item.sessionId))
               const meta = []
               if (info && info.workspaceTitle) meta.push('工作区：' + info.workspaceTitle)
               meta.push(item.text.length + ' 字')
               if (item.refCount > 0) meta.push(item.refCount + ' 个引用')
               if (info && info.blank) meta.push('未发送会话')
-              if (info && info.archived) meta.push('已归档')
+              if (info && info.running) meta.push('运行中')
               if (orphan) meta.push('目录里查不到（孤立草稿）')
+              if (fromBackup) meta.push('仅存于备份' + (item.savedAt ? '（' + fmtTime(item.savedAt) + '）' : ''))
 
               return h('div', { key: item.key, className: 'dshud-row', role: 'group' }, [
                 h('button', {
@@ -741,6 +967,20 @@ window.__ModuleLoader__.load({
             h('div', { key: 'dn', className: 'dshud-hint', style: { marginTop: '8px' } },
               '诊断区显示本插件实际看到了什么：扫到多少个键、命中的前缀、'
               + '会话目录是否取到、切会话 API 是否存在。跳转失败时先看这里。'),
+            backupTotal > 0
+              ? h('div', { key: 'cb', style: { marginTop: '10px' } }, [
+                h('button', {
+                  key: 'cb-btn',
+                  className: 'dshud-btn',
+                  type: 'button',
+                  onClick: onClearBackup,
+                  title: '删除插件保存的全部草稿备份记录',
+                }, '清空草稿备份（' + backupTotal + ' 条）'),
+                h('div', { key: 'cb-hint', className: 'dshud-hint', style: { marginTop: '6px' } },
+                  '备份是插件存在自己键（' + BACKUP_KEY + '）下的历史副本，'
+                  + '用于找回被 DSH 清空的草稿。清空后不可恢复。'),
+              ])
+              : null,
           ]),
         ]),
       ])
