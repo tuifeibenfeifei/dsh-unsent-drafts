@@ -137,9 +137,28 @@ DSH 没有把「草稿」作为 Host 侧可查询的数据暴露出来（草稿�
 | 同页面输入不触发 `storage` 事件 | 所以用 1.2 秒轮询兜底，不是实时 |
 | 草稿恢复依赖 DSH 自身 | 插件只负责切回会话，回填由 DSH 完成。若某版本改了回填时机，跳回后可能需要多点一下输入框 |
 | 跨工作区草稿 | 面板能列出并显示工作区名，但跳转走的是 `uiWorkspace.openSession`，跨工作区时由宿主决定是否切换工作区 |
-| 视觉未验证 | 注册与语法已验证，但无浏览器控制，实际渲染效果需用户在页面上确认 |
+| 空白会话切走后草稿可能被清空 | DSH 自身在切换会话时会把草稿搬到新会话并清空源会话（`from.setDraft("")`）。这是宿主行为，插件无法阻止；面板只能显示当前仍存在于 localStorage 的草稿 |
 
 ## 开发注意事项
+
+**必须声明 inject，不能直接读 ctx 属性。** Cordis 的 `Context` 是 Proxy，
+访问未在 `inject` 里声明的服务属性会**直接抛**
+`cannot get property "xxx" without inject`，表现为面板白屏。本插件需要
+`sessions` / `uiWorkspace` / `layout`，已写进 `exports.inject`；取值统一走
+内部 `svc(name)`（即 `ctx.get(name)`，未挂载时返回 null）。
+
+**hooks 不要在模块级解构。** `const { useState } = require('react')` 会让
+React 实例被替换后拿到过期引用，调用即抛 `Invalid hook call`，同样白屏。
+应在组件每次渲染时从当前 `React` 对象现取。
+
+**面板必须包错误边界。** 否则任何渲染异常都被宿主吞掉，只留一片白屏，
+连诊断按钮都不渲染，无法排查。`PanelBoundary` 会把错误信息和堆栈直接
+画在面板里。
+
+**扫描 localStorage 不能用 `Object.keys`。** `Storage` 的键是「具名属性」，
+不是自有可枚举属性，部分 Chromium/Electron 构建里 `Object.keys(localStorage)`
+返回空数组，症状是面板永远显示「没有未发送草稿」。必须用
+`localStorage.length` + `localStorage.key(i)` 枚举，`Object.keys` 仅作并集兜底。
 
 **改 UI 前先确认渲染者。** 若侧栏行没出现，先看诊断：
 浏览器控制台执行 `window.__dshUnsentDraftsDiag`，应看到
@@ -179,6 +198,13 @@ dsh-unsent-drafts/
 
 - **1.0.0** — 首个版本：草稿扫描（前缀自适应 + 双格式兼容）、会话目录匹配、
   跳转尝试链、复制兜底、诊断区
+- **1.0.1** — 修复面板永远为空：改用 `length`/`key(i)` 枚举 localStorage；
+  诊断区增加页面 origin、前几个键名、解析失败计数
+- **1.0.2** — 修复面板白屏：hooks 改为每次渲染现取（不在模块级解构）；
+  新增错误边界，渲染异常直接显示在面板里
+- **1.0.3** — 修复 `cannot get property "uiWorkspace" without inject`：
+  补全 inject 声明（`sessions`/`uiWorkspace`/`layout`），服务取值统一走
+  `ctx.get()` 包装的 `svc()`，未挂载时返回 null 而非抛错
 
 ## 许可证
 
