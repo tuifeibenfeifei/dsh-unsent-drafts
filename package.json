@@ -1,6 +1,6 @@
 {
   "name": "dsh-unsent-drafts",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "displayName": "DSH 未发送草稿",
   "description": "找回切换会话后丢失的未发送草稿：扫描本地草稿存储，列出所有有草稿的会话，一键跳回并恢复输入。",
   "type": "module",

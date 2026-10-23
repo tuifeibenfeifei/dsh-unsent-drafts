@@ -358,6 +358,55 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 常驻采集器。
+     *
+     * ⚠️ 这是备份功能能否生效的**关键**：如果只在面板打开时才扫描，
+     * 那用户「打完字 → 切走 → 再打开面板」的路径下，DSH 早在切走时
+     * 就把草稿清空了，插件此时才开始扫，永远是空的。
+     *
+     * 所以采集必须在插件加载后就启动、一直跑，与面板是否打开无关。
+     * 间隔比面板轮询略长（面板可见时才需要 1.2s 的跟手度）。
+     */
+    const WATCH_INTERVAL_MS = 2000
+    let watcherTimer = null
+    let watcherStats = { ticks: 0, captured: 0, lastError: null }
+
+    function startWatcher() {
+      if (watcherTimer !== null) return
+      const tick = () => {
+        try {
+          const scan = scanDrafts()
+          if (scan.error) {
+            watcherStats.lastError = scan.error
+            return
+          }
+          watcherStats.lastError = null
+          watcherStats.ticks += 1
+          if (scan.items.length > 0) {
+            const before = readBackup().length
+            mergeIntoBackup(scan.items)
+            const after = readBackup().length
+            if (after > before) watcherStats.captured += after - before
+          }
+        } catch (e) {
+          watcherStats.lastError = errMsg(e)
+        }
+      }
+      tick()
+      try {
+        watcherTimer = setInterval(tick, WATCH_INTERVAL_MS)
+      } catch {
+        watcherTimer = null
+      }
+    }
+
+    function stopWatcher() {
+      if (watcherTimer === null) return
+      try { clearInterval(watcherTimer) } catch { /* 忽略 */ }
+      watcherTimer = null
+    }
+
+    /**
      * 汇总要展示的草稿：实时 ∪ 历史备份。
      *
      * 同一会话只出一行，实时优先（`source: 'live'`）；实时已经为空、
@@ -555,6 +604,41 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 时间戳 → 相对时间（刚刚 / N 分钟前 / N 小时前 / N 天前），超过 7 天回落到日期 */
+    function relTime(ms) {
+      try {
+        const t = Number(ms)
+        if (!t || isNaN(t)) return ''
+        const diff = Date.now() - t
+        if (diff < 0) return '刚刚'
+        const min = Math.floor(diff / 60000)
+        if (min < 1) return '刚刚'
+        if (min < 60) return min + ' 分钟前'
+        const hour = Math.floor(min / 60)
+        if (hour < 24) return hour + ' 小时前'
+        const day = Math.floor(hour / 24)
+        if (day < 7) return day + ' 天前'
+        return fmtTime(t)
+      } catch {
+        return ''
+      }
+    }
+
+    /** 删除某条备份（按 sessionId + text 精确定位） */
+    function removeBackupEntry(sessionId, text) {
+      try {
+        const ls = (typeof window !== 'undefined' && window.localStorage) || null
+        if (!ls) return false
+        const entries = readBackup().filter(
+          (e) => !(e.sessionId === sessionId && e.text === text),
+        )
+        ls.setItem(BACKUP_KEY, JSON.stringify({ version: 1, entries }))
+        return true
+      } catch {
+        return false
+      }
+    }
+
     function copyText(text) {
       const done = () => true
       try {
@@ -644,6 +728,13 @@ window.__ModuleLoader__.load({
       '.dshud-empty{padding:26px 12px;text-align:center;border-radius:10px;',
       '  border:1px dashed var(--dsw-alias-border-primary,rgba(127,127,127,.28));',
       '  color:var(--dsw-alias-text-secondary,#9ca3af)}',
+      '.dshud-input{width:100%;padding:7px 10px;border-radius:8px;font:inherit;font-size:12.5px;',
+      '  box-sizing:border-box;color:inherit;',
+      '  background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.05));',
+      '  border:1px solid var(--dsw-alias-border-primary,rgba(127,127,127,.2))}',
+      '.dshud-input:focus{outline:2px solid var(--dsw-alias-state-info-primary,#3b82f6);outline-offset:1px;',
+      '  border-color:transparent}',
+      '.dshud-input::placeholder{color:var(--dsw-alias-text-tertiary,#6b7280)}',
       '.dshud-diag{margin:0;padding:10px 12px;border-radius:8px;overflow-x:auto;',
       '  background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.05));',
       '  border:1px solid var(--dsw-alias-border-primary,rgba(127,127,127,.14));',
@@ -827,8 +918,30 @@ window.__ModuleLoader__.load({
         refresh()
       }, [refresh])
 
+      const onRemoveOne = useCallback((item) => {
+        const ok = removeBackupEntry(item.sessionId, item.text)
+        setNote(ok
+          ? { kind: 'good', text: '已删除该条备份。' }
+          : { kind: 'bad', text: '删除失败。' })
+        refresh()
+      }, [refresh])
+
       // 「仅看仍存在的草稿」：过滤掉只存在于备份里的历史条目
-      const visible = onlyLive ? items.filter((it) => it.source === 'live') : items
+      const [query, setQuery] = useState('')
+      const q = query.trim().toLowerCase()
+      const visible = items
+        .filter((it) => (onlyLive ? it.source === 'live' : true))
+        .filter((it) => {
+          if (!q) return true
+          const info = catalog ? catalog[String(it.sessionId)] : undefined
+          const hay = [
+            it.text,
+            it.sessionId,
+            info && info.title,
+            info && info.workspaceTitle,
+          ].filter(Boolean).join(' ').toLowerCase()
+          return hay.includes(q)
+        })
       const backupOnlyCount = items.filter((it) => it.source === 'backup').length
 
       const prefixSummary = Object.keys(scanInfo.prefixes || {})
@@ -843,6 +956,9 @@ window.__ModuleLoader__.load({
         'JSON 解析失败：' + (scanInfo.parseFailed || 0) + ' 条；无草稿字段：' + (scanInfo.noDraft || 0) + ' 条',
         '扫描上限：' + SCAN_LIMIT + ' 条',
         '草稿备份：' + backupTotal + ' 条（只存在于备份、localStorage 已清空的：' + backupOnlyCount + ' 条）',
+        '后台采集器：' + (watcherTimer !== null ? '运行中' : '未启动')
+          + '，已采集 ' + watcherStats.captured + ' 条，轮询 ' + watcherStats.ticks + ' 次'
+          + (watcherStats.lastError ? '，最近错误：' + watcherStats.lastError : ''),
         '会话目录：' + (catalog === null ? '未取到（将只显示 sessionId）' : '已取到 ' + Object.keys(catalog).length + ' 个会话'),
         '切会话 API：uiWorkspace.openSession=' + (svc('uiWorkspace') && typeof svc('uiWorkspace').openSession === 'function' ? '有' : '无')
           + '，sessions.retain=' + (svc('sessions') && typeof svc('sessions').retain === 'function' ? '有' : '无'),
@@ -876,6 +992,18 @@ window.__ModuleLoader__.load({
             '这里列出所有「打了字但还没发送」的会话。点击某一条即可切回该会话，'
             + '草稿会由 DSH 自动回填到输入框。'),
 
+          items.length > 0
+            ? h('input', {
+              key: 'q',
+              className: 'dshud-input',
+              type: 'search',
+              value: query,
+              placeholder: '搜索草稿内容 / 标题 / 会话 ID…',
+              'aria-label': '搜索草稿',
+              onChange: (e) => setQuery(e && e.target ? e.target.value : ''),
+            })
+            : null,
+
           backupOnlyCount > 0
             ? h('div', { key: 'bkinfo', className: 'dshud-tip' },
               '其中 ' + backupOnlyCount + ' 条来自本插件的草稿备份——它们在 DSH 里已被清空'
@@ -896,11 +1024,14 @@ window.__ModuleLoader__.load({
 
           visible.length === 0
             ? h('div', { key: 'empty', className: 'dshud-empty' }, [
-              h('div', { key: 'e1', style: { fontWeight: 700 } }, '没有未发送草稿'),
+              h('div', { key: 'e1', style: { fontWeight: 700 } },
+                q ? '没有匹配的草稿' : '没有未发送草稿'),
               h('div', { key: 'e2', style: { marginTop: '4px', fontSize: '12px' } },
-                onlyLive
-                  ? '当前没有仍存在于 localStorage 的草稿。点「显示全部」可看备份里的历史记录。'
-                  : '新建会话打几个字、不要发送，再切到别的会话，这里就会出现一条。'),
+                q
+                  ? '试试换个关键词，或清空搜索框。'
+                  : onlyLive
+                    ? '当前没有仍存在于 localStorage 的草稿。点「显示全部」可看备份里的历史记录。'
+                    : '新建会话打几个字、不要发送，再切到别的会话，这里就会出现一条。'),
             ])
             : h('div', { key: 'list', className: 'dshud-list' }, visible.map((item) => {
               const info = catalog ? catalog[String(item.sessionId)] : undefined
@@ -914,7 +1045,7 @@ window.__ModuleLoader__.load({
               if (info && info.blank) meta.push('未发送会话')
               if (info && info.running) meta.push('运行中')
               if (orphan) meta.push('目录里查不到（孤立草稿）')
-              if (fromBackup) meta.push('仅存于备份' + (item.savedAt ? '（' + fmtTime(item.savedAt) + '）' : ''))
+              if (fromBackup) meta.push('仅存于备份' + (item.savedAt ? '（' + relTime(item.savedAt) + '）' : ''))
 
               return h('div', { key: item.key, className: 'dshud-row', role: 'group' }, [
                 h('button', {
@@ -950,6 +1081,15 @@ window.__ModuleLoader__.load({
                     onClick: () => { onJump(item.sessionId) },
                     title: '切回该会话',
                   }, orphan ? '尝试跳回' : '跳回'),
+                  fromBackup
+                    ? h('button', {
+                      key: 'del',
+                      className: 'dshud-btn',
+                      type: 'button',
+                      onClick: () => { onRemoveOne(item) },
+                      title: '从备份中删除这一条',
+                    }, '删除')
+                    : null,
                 ]),
               ])
             })),
@@ -1025,6 +1165,13 @@ window.__ModuleLoader__.load({
         : {})
       if (diag.panellist === undefined) diag.panellist = 'pending'
       if (diag.panel === undefined) diag.panel = 'pending'
+
+      // 常驻采集：插件一加载就开跑，不依赖面板是否打开。
+      // 这是「切走会话后草稿被 DSH 清空」还能救回来的前提。
+      ctx.effect(() => {
+        startWatcher()
+        return () => { stopWatcher() }
+      }, 'unsent-drafts: draft watcher')
 
       ctx.effect(
         () => ctx.locale.register(NAMESPACE, {
