@@ -251,11 +251,29 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     /**
-     * 用 ctx.sessions.search 拉会话目录（Host 侧搜索，空 query = 全量）。
+     * 安全取一个 Client 服务。
+     *
+     * ⚠️ 不能直接写 ctx.uiWorkspace / ctx.sessions：Cordis 的 Context 用 Proxy
+     * 拦截属性访问，未在 inject 里声明的服务会**直接抛**
+     * `cannot get property "x" without inject`（我们第一版就是这么白屏的）。
+     * ctx.get(name) 是合法的按名取值，未挂载时返回 undefined，不会抛。
+     */
+    function svc(name) {
+      try {
+        if (!hostCtx) return null
+        const v = typeof hostCtx.get === 'function' ? hostCtx.get(name) : undefined
+        return v || null
+      } catch {
+        return null
+      }
+    }
+
+    /**
+     * 用 sessions.search 拉会话目录（Host 侧搜索，空 query = 全量）。
      * 失败返回 null，由调用方退化成「只显示 sessionId」。
      */
     async function loadSessionCatalog() {
-      const s = hostCtx && hostCtx.sessions
+      const s = svc('sessions')
       if (!s || typeof s.search !== 'function') return null
       try {
         const ac = typeof AbortController !== 'undefined' ? new AbortController() : null
@@ -304,7 +322,7 @@ window.__ModuleLoader__.load({
      */
     async function switchToSession(sessionId) {
       const attempts = []
-      const ws = hostCtx && hostCtx.uiWorkspace
+      const ws = svc('uiWorkspace')
 
       if (ws && typeof ws.openSession === 'function') {
         for (const target of [sessionId, { sessionId }]) {
@@ -319,7 +337,7 @@ window.__ModuleLoader__.load({
         attempts.push('uiWorkspace.openSession 不存在')
       }
 
-      const s = hostCtx && hostCtx.sessions
+      const s = svc('sessions')
       if (s && typeof s.retain === 'function') {
         for (const target of [sessionId, { sessionId }]) {
           try {
@@ -622,8 +640,8 @@ window.__ModuleLoader__.load({
         'JSON 解析失败：' + (scanInfo.parseFailed || 0) + ' 条；无草稿字段：' + (scanInfo.noDraft || 0) + ' 条',
         '扫描上限：' + SCAN_LIMIT + ' 条',
         '会话目录：' + (catalog === null ? '未取到（将只显示 sessionId）' : '已取到 ' + Object.keys(catalog).length + ' 个会话'),
-        '切会话 API：uiWorkspace.openSession=' + (hostCtx && hostCtx.uiWorkspace && typeof hostCtx.uiWorkspace.openSession === 'function' ? '有' : '无')
-          + '，sessions.retain=' + (hostCtx && hostCtx.sessions && typeof hostCtx.sessions.retain === 'function' ? '有' : '无'),
+        '切会话 API：uiWorkspace.openSession=' + (svc('uiWorkspace') && typeof svc('uiWorkspace').openSession === 'function' ? '有' : '无')
+          + '，sessions.retain=' + (svc('sessions') && typeof svc('sessions').retain === 'function' ? '有' : '无'),
         '默认提示前缀：' + HINT_PREFIX,
       ].join('\n')
 
@@ -732,7 +750,17 @@ window.__ModuleLoader__.load({
     // 注册
     // ------------------------------------------------------------------
 
-    const inject = ['slots', 'locale']
+    /**
+     * 声明本插件用到的 Client 服务。
+     *
+     * Cordis 的 Context 是 Proxy：访问未 inject 的属性会直接抛
+     * `cannot get property "x" without inject`。面板里要用会话目录和切会话，
+     * 所以必须在这里声明；少一个就在渲染时炸成白屏。
+     *
+     * 注意：这里的 inject 是「可选依赖」语义——宿主没装该服务时插件仍会加载，
+     * 只是 ctx.get 返回 undefined，由 svc() 兜底为 null。
+     */
+    const inject = ['slots', 'locale', 'sessions', 'uiWorkspace', 'layout']
 
     /**
      * 插件入口。
@@ -807,11 +835,8 @@ window.__ModuleLoader__.load({
           }
         })
 
-        try {
-          ctx.inject(['layout'], (scoped) => {
-            layoutRef = scoped && scoped.layout ? scoped.layout : null
-          })
-        } catch { /* 宿主无 layout 服务时忽略 */ }
+        // 卸载时用来把面板退回会话；按名取值，避免多声明一个硬 inject
+        try { layoutRef = svc('layout') } catch { /* 忽略 */ }
 
         return () => {
           try {
