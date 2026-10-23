@@ -119,6 +119,32 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 枚举 localStorage 的全部键。
+     *
+     * ⚠️ 不能只用 Object.keys(localStorage)：Storage 是「具名属性」宿主对象，
+     * 在部分 Chromium/Electron 构建里 Object.keys() 会返回空数组，症状就是
+     * 面板能打开但永远显示「没有未发送草稿」。这里用 length/key(i) 为主、
+     * Object.keys 做并集兜底，两条路都走一遍。
+     */
+    function enumerateKeys(ls) {
+      const out = []
+      const seen = new Set()
+      const push = (k) => {
+        if (typeof k === 'string' && k && !seen.has(k)) { seen.add(k); out.push(k) }
+      }
+      try {
+        const n = typeof ls.length === 'number' ? ls.length : 0
+        for (let i = 0; i < n; i++) {
+          try { push(ls.key(i)) } catch { /* 单个键取失败不影响其他 */ }
+        }
+      } catch { /* length/key 不可用时退回 Object.keys */ }
+      try {
+        for (const k of Object.keys(ls)) push(k)
+      } catch { /* 忽略 */ }
+      return out
+    }
+
+    /**
      * 扫描 localStorage。
      * 返回 { items, total, prefixes, error }——永远不抛。
      *
@@ -137,18 +163,28 @@ window.__ModuleLoader__.load({
 
       let keys = []
       try {
-        keys = Object.keys(ls)
+        keys = enumerateKeys(ls)
       } catch (e) {
-        return { items: [], total: 0, prefixes: {}, error: 'Object.keys(localStorage) 失败：' + errMsg(e) }
+        return { items: [], total: 0, prefixes: {}, sample: [], error: '枚举 localStorage 失败：' + errMsg(e) }
+      }
+      if (keys.length === 0) {
+        let len = -1
+        try { len = ls.length } catch { /* 忽略 */ }
+        return {
+          items: [], total: 0, prefixes: {}, sample: [], parseFailed: 0, noDraft: 0,
+          error: '枚举到 0 个键（localStorage.length=' + len + '）。可能是页面无存储权限，或键不在本页 origin 下。',
+        }
       }
 
       const items = []
       const prefixes = {}
+      const sample = []
       let parseFailed = 0
       let noDraft = 0
 
       for (const key of keys) {
         if (items.length >= SCAN_LIMIT) break
+        if (sample.length < 8) sample.push(key)
         let raw = null
         try {
           raw = ls.getItem(key)
@@ -187,6 +223,7 @@ window.__ModuleLoader__.load({
         items,
         total: keys.length,
         prefixes,
+        sample,
         parseFailed,
         noDraft,
         error: null,
@@ -445,7 +482,7 @@ window.__ModuleLoader__.load({
 
       const [items, setItems] = useState([])
       const [catalog, setCatalog] = useState(null)
-      const [scanInfo, setScanInfo] = useState({ total: 0, prefixes: {}, error: null })
+      const [scanInfo, setScanInfo] = useState({ total: 0, prefixes: {}, sample: [], error: null })
       const [busy, setBusy] = useState(false)
       const [note, setNote] = useState(null)
       const [showDiag, setShowDiag] = useState(false)
@@ -460,7 +497,14 @@ window.__ModuleLoader__.load({
       const refresh = useCallback(() => {
         const r = scanDrafts()
         setItems(r.items)
-        setScanInfo({ total: r.total, prefixes: r.prefixes || {}, error: r.error })
+        setScanInfo({
+          total: r.total,
+          prefixes: r.prefixes || {},
+          sample: r.sample || [],
+          parseFailed: r.parseFailed || 0,
+          noDraft: r.noDraft || 0,
+          error: r.error,
+        })
       }, [])
 
       // 首次 + 定时同步。storage 事件只跨标签页触发，同页面输入不触发，
@@ -505,8 +549,11 @@ window.__ModuleLoader__.load({
         .join('　') || '（无）'
 
       const diagText = [
+        '页面 origin：' + (typeof location !== 'undefined' ? location.origin : '(未知)'),
         'localStorage 键总数：' + scanInfo.total,
+        '前几个键：' + ((scanInfo.sample && scanInfo.sample.length) ? scanInfo.sample.join('、') : '（无）'),
         '识别到的草稿前缀：' + prefixSummary,
+        'JSON 解析失败：' + (scanInfo.parseFailed || 0) + ' 条；无草稿字段：' + (scanInfo.noDraft || 0) + ' 条',
         '扫描上限：' + SCAN_LIMIT + ' 条',
         '会话目录：' + (catalog === null ? '未取到（将只显示 sessionId）' : '已取到 ' + Object.keys(catalog).length + ' 个会话'),
         '切会话 API：uiWorkspace.openSession=' + (hostCtx && hostCtx.uiWorkspace && typeof hostCtx.uiWorkspace.openSession === 'function' ? '有' : '无')
