@@ -1,0 +1,11 @@
+# Dependencies (should not be present in source repo)
+node_modules/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Local build / temp
+dist/
+*.tmp

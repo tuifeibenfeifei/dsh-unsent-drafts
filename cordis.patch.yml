@@ -1,0 +1,10 @@
+# 挂载 dsh-unsent-drafts 宿主侧插件。
+#
+# 本插件是**纯客户端插件**：宿主半身不做任何事（index.js 是空 apply），
+# 只负责在 Loader 里插入一行，让 dsh.client 声明的浏览器半身被加载。
+#
+# 为什么必须有这一行：dsh.client 的 platform/inject 声明挂在**插件行**上，
+# 没有插件行就没有客户端半身。参见 dsh-cost-tracker 的 cordis.patch.yml 注释。
+- insert:
+    - id: unsent-drafts
+      name: dsh-unsent-drafts

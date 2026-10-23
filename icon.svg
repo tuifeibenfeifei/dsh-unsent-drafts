@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <title>未发送草稿</title>
+  <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h8L20 8.5v10A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5v-13Z" />
+  <path d="M14 3v6h6" opacity="0.55" />
+  <path d="M8 13.5h7M8 17h4.5" />
+</svg>
