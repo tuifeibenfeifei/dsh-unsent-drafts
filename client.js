@@ -48,7 +48,19 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
     const React = require('react')
-    const { createElement: h, useState, useEffect, useRef, useCallback } = React
+    const h = React.createElement
+
+    /**
+     * ⚠️ hooks 不能在模块级解构。
+     *
+     * 宿主可能把 React 实例替换/重新加载（HMR、多份 React），模块级解构会拿到
+     * 一份过期的 useState/useEffect，调用时直接抛
+     * "Invalid hook call / dispatcher is null"，表现就是面板白屏。
+     * 这里每次渲染都从当前 React 对象上现取。
+     */
+    function useReact() {
+      return React
+    }
 
     // ------------------------------------------------------------------
     // 常量
@@ -477,8 +489,62 @@ window.__ModuleLoader__.load({
       ])
     }
 
+    /**
+     * 错误边界：把渲染异常显示在面板里，而不是让宿主吞掉变成白屏。
+     * 没有它时，任何渲染错误都表现为「点开面板一片空白、连诊断按钮都没有」。
+     */
+    class PanelBoundary extends React.Component {
+      constructor(props) {
+        super(props)
+        this.state = { err: null, info: '' }
+      }
+
+      static getDerivedStateFromError(err) {
+        return { err }
+      }
+
+      componentDidCatch(err, info) {
+        try {
+          console.error('[dsh-unsent-drafts] panel render error:', err, info)
+        } catch { /* 忽略 */ }
+        this.setState({ info: (info && info.componentStack) || '' })
+      }
+
+      render() {
+        if (this.state.err) {
+          const e = this.state.err
+          const text = [
+            '面板渲染失败（插件内部错误，不是 DSH 的问题）：',
+            String(e && e.message ? e.message : e),
+            '',
+            String(e && e.stack ? e.stack : '').split('\n').slice(0, 12).join('\n'),
+          ].join('\n')
+          return React.createElement('div', {
+            className: 'dshud-root',
+            style: { padding: '18px 20px' },
+          }, [
+            React.createElement('h2', { key: 't', style: { margin: '0 0 10px', fontSize: '16px' } }, '未发送草稿'),
+            React.createElement('pre', {
+              key: 'e',
+              className: 'dshud-diag',
+              style: { whiteSpace: 'pre-wrap', color: '#d92d20' },
+            }, text),
+          ])
+        }
+        return this.props.children
+      }
+    }
+
+    /** 对外入口：套一层错误边界，保证任何异常都可见 */
+    function DraftsPanelGuarded() {
+      return React.createElement(PanelBoundary, null, React.createElement(DraftsPanel))
+    }
+
     function DraftsPanel() {
       mountCss()
+
+      // 每次渲染从当前 React 实例取 hooks（理由见 useReact 注释）
+      const { useState, useEffect, useCallback } = useReact()
 
       const [items, setItems] = useState([])
       const [catalog, setCatalog] = useState(null)
@@ -718,7 +784,7 @@ window.__ModuleLoader__.load({
               name: 'main',
               key: PANEL_ID,
               locale: NAMESPACE,
-            }, DraftsPanel)
+            }, DraftsPanelGuarded)
             diag.panel = 'registered'
           } catch (e) {
             diag.panel = 'failed: ' + errMsg(e)
